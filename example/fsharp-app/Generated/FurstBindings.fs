@@ -69,3 +69,22 @@ extern float area(ShapeFfi shape)
 
 [<DllImport(NativeLib, EntryPoint = "greet", CallingConvention = CallingConvention.Cdecl)>]
 extern FurstStr greet(nativeint name_ptr, unativeint name_len)
+
+// --- Counter (opaque handle) ---
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type CounterHandle =
+    val mutable private ptr: nativeint
+
+[<DllImport(NativeLib, EntryPoint = "counter_new", CallingConvention = CallingConvention.Cdecl)>]
+extern CounterHandle counter_new(int64 initial)
+
+[<DllImport(NativeLib, EntryPoint = "counter_increment", CallingConvention = CallingConvention.Cdecl)>]
+extern void counter_increment(CounterHandle this)
+
+[<DllImport(NativeLib, EntryPoint = "counter_get", CallingConvention = CallingConvention.Cdecl)>]
+extern int64 counter_get(CounterHandle this)
+
+[<DllImport(NativeLib, EntryPoint = "counter_free", CallingConvention = CallingConvention.Cdecl)>]
+extern void counter_free(CounterHandle this)
+

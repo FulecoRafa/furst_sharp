@@ -57,6 +57,8 @@ enum FfiType {
     StrRef,
     OwnedString,
     Named(String),
+    /// `*mut T` or `*const T` — opaque handle, maps to `nativeint` in F#
+    OpaquePtr,
 }
 
 fn classify(ty: &syn::Type) -> Option<FfiType> {
@@ -83,6 +85,7 @@ fn classify(ty: &syn::Type) -> Option<FfiType> {
             }
             None
         }
+        syn::Type::Ptr(_) => Some(FfiType::OpaquePtr),
         syn::Type::Tuple(t) if t.elems.is_empty() => Some(FfiType::Unit),
         _ => None,
     }
@@ -108,6 +111,7 @@ fn fsharp_type(ty: &FfiType, tagged_enum_names: &HashSet<String>) -> String {
                 n.clone()
             }
         }
+        FfiType::OpaquePtr => "nativeint".into(),
     }
 }
 
@@ -117,6 +121,29 @@ enum ExportItem {
     Fn(syn::ItemFn),
     Struct(syn::ItemStruct),
     Enum(syn::ItemEnum),
+    Impl(ImplExport),
+}
+
+#[derive(Clone, Debug)]
+struct ImplExport {
+    type_name: String,
+    methods: Vec<ImplMethod>,
+}
+
+#[derive(Clone, Debug)]
+struct ImplMethod {
+    ffi_name: String,
+    receiver: ReceiverKind,
+    params: Vec<(String, FfiType)>,
+    ret: FfiType,
+    returns_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ReceiverKind {
+    None,
+    Ref,
+    MutRef,
 }
 
 // ─── Visitor ──────────────────────────────────────────────────────────────
@@ -149,6 +176,108 @@ impl<'ast> Visit<'ast> for FurstVisitor {
         if has_furst_export(&node.attrs) {
             self.exports.push(ExportItem::Enum(node.clone()));
         }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if !has_furst_export(&node.attrs) {
+            return;
+        }
+        // Extract type name
+        let type_name = match node.self_ty.as_ref() {
+            syn::Type::Path(tp) if tp.qself.is_none() => {
+                tp.path.segments.last().unwrap().ident.to_string()
+            }
+            _ => return,
+        };
+
+        let snake_prefix = to_snake(&type_name);
+        let mut methods = Vec::new();
+        let mut has_free = false;
+
+        for item in &node.items {
+            let syn::ImplItem::Fn(method) = item else { continue };
+
+            let method_name = method.sig.ident.to_string();
+            let ffi_name = format!("{}_{}", snake_prefix, method_name);
+
+            if method_name == "free" {
+                has_free = true;
+            }
+
+            // Determine receiver
+            let receiver = match method.sig.inputs.first() {
+                Some(syn::FnArg::Receiver(r)) => {
+                    if r.reference.is_some() {
+                        if r.mutability.is_some() {
+                            ReceiverKind::MutRef
+                        } else {
+                            ReceiverKind::Ref
+                        }
+                    } else {
+                        // Check typed form: self: &Self / self: &mut Self
+                        match r.ty.as_ref() {
+                            syn::Type::Reference(ref_ty) => {
+                                if ref_ty.mutability.is_some() {
+                                    ReceiverKind::MutRef
+                                } else {
+                                    ReceiverKind::Ref
+                                }
+                            }
+                            _ => continue, // skip self-by-value
+                        }
+                    }
+                }
+                _ => ReceiverKind::None,
+            };
+
+            // Classify params (skip self)
+            let mut params = Vec::new();
+            for input in method.sig.inputs.iter() {
+                let syn::FnArg::Typed(pt) = input else { continue };
+                let pname = match pt.pat.as_ref() {
+                    syn::Pat::Ident(pi) => pi.ident.to_string(),
+                    _ => continue,
+                };
+                let ffi = match classify(&pt.ty) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                params.push((pname, ffi));
+            }
+
+            // Classify return type
+            let returns_self = match &method.sig.output {
+                syn::ReturnType::Type(_, ty) => {
+                    matches!(ty.as_ref(), syn::Type::Path(tp)
+                        if tp.qself.is_none() && tp.path.is_ident("Self"))
+                }
+                _ => false,
+            };
+
+            let ret = if returns_self {
+                FfiType::OpaquePtr
+            } else {
+                match &method.sig.output {
+                    syn::ReturnType::Default => FfiType::Unit,
+                    syn::ReturnType::Type(_, ty) => classify(ty).unwrap_or(FfiType::Unit),
+                }
+            };
+
+            methods.push(ImplMethod { ffi_name, receiver, params, ret, returns_self });
+        }
+
+        // Auto-add free if not defined
+        if !has_free {
+            methods.push(ImplMethod {
+                ffi_name: format!("{}_free", snake_prefix),
+                receiver: ReceiverKind::MutRef,
+                params: vec![],
+                ret: FfiType::Unit,
+                returns_self: false,
+            });
+        }
+
+        self.exports.push(ExportItem::Impl(ImplExport { type_name, methods }));
     }
 }
 
@@ -241,12 +370,25 @@ fn generate_fsharp(exports: &[ExportItem], lib_name: &str) -> String {
     // Second pass: emit each item
     writeln!(out, "// --- Exported bindings ---").unwrap();
 
+    // Collect impl handle names for typed handle references
+    let impl_handle_names: HashSet<String> = exports
+        .iter()
+        .filter_map(|e| {
+            if let ExportItem::Impl(imp) = e {
+                Some(imp.type_name.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
     for item in exports {
         writeln!(out).unwrap();
         match item {
             ExportItem::Fn(func) => emit_fn(&mut out, func, &tagged_enum_names),
             ExportItem::Struct(strct) => emit_struct(&mut out, strct, &tagged_enum_names),
             ExportItem::Enum(enm) => emit_enum(&mut out, enm, &tagged_enum_names),
+            ExportItem::Impl(imp) => emit_impl(&mut out, imp, &tagged_enum_names, &impl_handle_names),
         }
     }
 
@@ -433,6 +575,65 @@ fn emit_enum(out: &mut String, enm: &syn::ItemEnum, tagged: &HashSet<String>) {
     writeln!(out, "type {} =", ffi_name).unwrap();
     writeln!(out, "    val mutable tag: {}", tag_name).unwrap();
     writeln!(out, "    val mutable data: {}", union_name).unwrap();
+}
+
+fn emit_impl(out: &mut String, imp: &ImplExport, tagged: &HashSet<String>, _handles: &HashSet<String>) {
+    let handle_name = format!("{}Handle", imp.type_name);
+
+    // Emit handle struct
+    writeln!(out, "// --- {} (opaque handle) ---", imp.type_name).unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "[<Struct; StructLayout(LayoutKind.Sequential)>]").unwrap();
+    writeln!(out, "type {} =", handle_name).unwrap();
+    writeln!(out, "    val mutable private ptr: nativeint").unwrap();
+    writeln!(out).unwrap();
+
+    // Emit each method as a DllImport
+    for method in &imp.methods {
+        let mut params: Vec<String> = Vec::new();
+
+        // Add receiver param if present
+        match method.receiver {
+            ReceiverKind::Ref | ReceiverKind::MutRef => {
+                params.push(format!("{} this", handle_name));
+            }
+            ReceiverKind::None => {}
+        }
+
+        // Add remaining params
+        for (pname, ffi) in &method.params {
+            match ffi {
+                FfiType::StrRef => {
+                    params.push(format!("nativeint {}_ptr", pname));
+                    params.push(format!("unativeint {}_len", pname));
+                }
+                FfiType::OwnedString => continue,
+                other => {
+                    params.push(format!("{} {}", fsharp_type(other, tagged), pname));
+                }
+            }
+        }
+
+        // Return type
+        let ret_str = if method.returns_self {
+            handle_name.clone()
+        } else {
+            match &method.ret {
+                FfiType::Unit => "void".to_string(),
+                other => fsharp_type(other, tagged),
+            }
+        };
+
+        let params_str = params.join(", ");
+        let name = &method.ffi_name;
+
+        writeln!(
+            out,
+            "[<DllImport(NativeLib, EntryPoint = \"{name}\", CallingConvention = CallingConvention.Cdecl)>]"
+        ).unwrap();
+        writeln!(out, "extern {ret_str} {name}({params_str})").unwrap();
+        writeln!(out).unwrap();
+    }
 }
 
 fn to_snake(s: &str) -> String {

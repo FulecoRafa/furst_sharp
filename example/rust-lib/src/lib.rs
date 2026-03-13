@@ -4,11 +4,12 @@
 //! Output: `target/debug/librust_lib.so` (Linux)
 //!
 //! Covers every supported export kind:
-//!   - Primitives:    fibonacci
-//!   - Struct:        Point + distance
-//!   - C-style enum:  Direction + turn_right
-//!   - Tagged enum:   Shape (Circle/Rectangle) + area
-//!   - Strings:       greet (&str → String)
+//!   - Primitives:      fibonacci
+//!   - Struct:          Point + distance
+//!   - C-style enum:    Direction + turn_right
+//!   - Tagged enum:     Shape (Circle/Rectangle) + area
+//!   - Strings:         greet (&str → String)
+//!   - Opaque handles:  Counter (heap-allocated, *mut T)
 
 use furst_macro::furst_export;
 
@@ -62,9 +63,9 @@ pub enum Direction {
 pub fn turn_right(d: Direction) -> Direction {
     match d {
         Direction::North => Direction::East,
-        Direction::East  => Direction::South,
+        Direction::East => Direction::South,
         Direction::South => Direction::West,
-        Direction::West  => Direction::North,
+        Direction::West => Direction::North,
     }
 }
 
@@ -75,7 +76,7 @@ pub fn turn_right(d: Direction) -> Direction {
 /// and a `From<Shape> for ShapeFfi` impl.
 #[furst_export]
 pub enum Shape {
-    Circle    { radius: f64 },
+    Circle { radius: f64 },
     Rectangle { width: f64, height: f64 },
 }
 
@@ -89,9 +90,7 @@ pub fn area(shape: ShapeFfi) -> f64 {
             let r = unsafe { shape.data.circle.radius };
             std::f64::consts::PI * r * r
         }
-        ShapeTag::Rectangle => unsafe {
-            shape.data.rectangle.width * shape.data.rectangle.height
-        },
+        ShapeTag::Rectangle => unsafe { shape.data.rectangle.width * shape.data.rectangle.height },
     }
 }
 
@@ -102,6 +101,31 @@ pub fn area(shape: ShapeFfi) -> f64 {
 #[furst_export]
 pub fn greet(name: &str) -> String {
     format!("Hello, {}!", name)
+}
+
+// ─── Opaque handles (impl block pattern) ─────────────────────────────────
+
+/// A heap-allocated counter. Demonstrates the `#[furst_export] impl` pattern:
+/// write idiomatic Rust methods, get FFI functions + typed F# handles for free.
+pub struct Counter {
+    value: i64,
+}
+
+/// The macro generates: `counter_new`, `counter_increment`, `counter_get`,
+/// and auto-generates `counter_free` (since we didn't define one).
+#[furst_export]
+impl Counter {
+    pub fn new(initial: i64) -> Self {
+        Counter { value: initial }
+    }
+
+    pub fn increment(&mut self) {
+        self.value += 1;
+    }
+
+    pub fn get(&self) -> i64 {
+        self.value
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -132,10 +156,10 @@ mod tests {
 
     #[test]
     fn turn_right_cycle() {
-        assert_eq!(turn_right(Direction::North) as i32, Direction::East  as i32);
-        assert_eq!(turn_right(Direction::East)  as i32, Direction::South as i32);
-        assert_eq!(turn_right(Direction::South) as i32, Direction::West  as i32);
-        assert_eq!(turn_right(Direction::West)  as i32, Direction::North as i32);
+        assert_eq!(turn_right(Direction::North) as i32, Direction::East as i32);
+        assert_eq!(turn_right(Direction::East) as i32, Direction::South as i32);
+        assert_eq!(turn_right(Direction::South) as i32, Direction::West as i32);
+        assert_eq!(turn_right(Direction::West) as i32, Direction::North as i32);
     }
 
     #[test]
@@ -148,7 +172,10 @@ mod tests {
 
     #[test]
     fn area_rectangle() {
-        let s = Shape::Rectangle { width: 3.0, height: 4.0 };
+        let s = Shape::Rectangle {
+            width: 3.0,
+            height: 4.0,
+        };
         let ffi = ShapeFfi::from(s);
         assert_eq!(area(ffi), 12.0);
     }
@@ -158,5 +185,24 @@ mod tests {
         // Test via the inner function (no FFI boundary in tests)
         let result = __furst_inner_greet("World");
         assert_eq!(result, "Hello, World!");
+    }
+
+    #[test]
+    fn counter_lifecycle() {
+        let c = counter_new(10);
+        assert_eq!(counter_get(c), 10);
+        counter_increment(c);
+        counter_increment(c);
+        assert_eq!(counter_get(c), 12);
+        counter_free(c);
+    }
+
+    #[test]
+    fn counter_zero() {
+        let c = counter_new(0);
+        assert_eq!(counter_get(c), 0);
+        counter_increment(c);
+        assert_eq!(counter_get(c), 1);
+        counter_free(c);
     }
 }

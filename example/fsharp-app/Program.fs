@@ -93,6 +93,19 @@ let main _argv =
         let msg = withRustStr name (fun ptr len -> greet(ptr, len)) |> furstStrToString
         printfn "  greet(%12s) = %s" (sprintf "\"%s\"" name) msg
 
+    // ── 6. Opaque handles: Counter (typed CounterHandle) ───────────────────
+    printfn ""
+    printfn "[ opaque handles — Counter (impl block → typed CounterHandle) ]"
+    let c = counter_new 42L
+    printfn "  counter_new(42)    → CounterHandle"
+    printfn "  counter_get()      = %d" (counter_get c)
+    counter_increment c
+    counter_increment c
+    counter_increment c
+    printfn "  after 3 increments = %d" (counter_get c)   // 45
+    counter_free c
+    printfn "  counter_free()     ✓"
+
     printfn ""
     printfn "═══════════════════════════════════════"
     printfn "All examples completed successfully!"

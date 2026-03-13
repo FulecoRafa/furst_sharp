@@ -8,6 +8,7 @@
 //! - Primitives: `i32`, `i64`, `u32`, `u64`, `f32`, `f64`, `bool`
 //! - Strings: `&str` (input) splits into `(ptr: *const u8, len: usize)`
 //! - Owned strings: `String` (return only) becomes `::furst_rt::FurstStr`
+//! - Opaque handles: `*mut T` / `*const T` pass through as raw pointers (F# `nativeint`)
 //! - Structs: gains `#[repr(C)]`, all fields must be FFI-safe
 //! - C-style enums: gains `#[repr(i32)]`
 //! - Tagged enums: generates Tag enum + Data structs + Union + Ffi wrapper
@@ -15,7 +16,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{ItemEnum, ItemFn, ItemStruct};
+use syn::{ItemEnum, ItemFn, ItemImpl, ItemStruct};
 
 // ─── Type classification ───────────────────────────────────────────────────
 
@@ -36,6 +37,9 @@ enum FfiType {
     OwnedString,
     /// A named type assumed to be a #[furst_export] struct or enum
     Named(syn::Ident),
+    /// `*mut T` or `*const T` — opaque handle, passes through as a raw pointer.
+    /// Maps to `nativeint` in F#.
+    OpaquePtr(syn::Type),
 }
 
 /// Classify a `syn::Type` into an `FfiType`, or return a span-accurate error.
@@ -69,11 +73,12 @@ fn classify(ty: &syn::Type) -> syn::Result<FfiType> {
                  consider using a primitive type or a #[furst_export] struct",
             ))
         }
+        syn::Type::Ptr(_) => Ok(FfiType::OpaquePtr(ty.clone())),
         syn::Type::Tuple(t) if t.elems.is_empty() => Ok(FfiType::Unit),
         _ => Err(syn::Error::new_spanned(
             ty,
             "#[furst_export]: type is not FFI-safe; supported types are: \
-             i32, i64, u32, u64, f32, f64, bool, &str, String, \
+             i32, i64, u32, u64, f32, f64, bool, &str, String, *mut T, *const T, \
              or a #[furst_export] struct/enum",
         )),
     }
@@ -100,8 +105,15 @@ pub fn furst_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     // Try ItemEnum
-    if let Ok(enm) = syn::parse::<ItemEnum>(item) {
+    if let Ok(enm) = syn::parse::<ItemEnum>(item.clone()) {
         return expand_enum(enm)
+            .unwrap_or_else(|e| e.to_compile_error())
+            .into();
+    }
+
+    // Try ItemImpl
+    if let Ok(imp) = syn::parse::<ItemImpl>(item) {
+        return expand_impl(imp)
             .unwrap_or_else(|e| e.to_compile_error())
             .into();
     }
@@ -109,7 +121,7 @@ pub fn furst_export(_attr: TokenStream, item: TokenStream) -> TokenStream {
     // Unsupported item kind
     syn::Error::new_spanned(
         TokenStream2::from(item2),
-        "#[furst_export] can only be applied to fn, struct, or enum",
+        "#[furst_export] can only be applied to fn, struct, enum, or impl",
     )
     .to_compile_error()
     .into()
@@ -272,6 +284,7 @@ fn ffi_type_to_rust_tokens(ty: &FfiType) -> TokenStream2 {
         FfiType::StrRef => quote! { *const u8 }, // shouldn't reach here
         FfiType::OwnedString => quote! { ::furst_rt::FurstStr },
         FfiType::Named(ident) => quote! { #ident },
+        FfiType::OpaquePtr(ty) => quote! { #ty },
     }
 }
 
@@ -475,6 +488,248 @@ fn expand_tagged_enum(enm: ItemEnum) -> syn::Result<TokenStream2> {
                 }
             }
         }
+    })
+}
+
+// ─── Impl export ──────────────────────────────────────────────────────────
+
+fn expand_impl(mut imp: ItemImpl) -> syn::Result<TokenStream2> {
+    // Reject trait impls
+    if imp.trait_.is_some() {
+        return Err(syn::Error::new_spanned(
+            &imp,
+            "#[furst_export]: trait impls are not supported; \
+             use `#[furst_export] impl TypeName { ... }` for inherent impls only",
+        ));
+    }
+
+    // Reject generics
+    if !imp.generics.params.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &imp.generics,
+            "#[furst_export]: generic impl blocks are not supported",
+        ));
+    }
+
+    // Extract type name from self_ty
+    let type_name = match imp.self_ty.as_ref() {
+        syn::Type::Path(tp) if tp.qself.is_none() => {
+            tp.path.segments.last().unwrap().ident.clone()
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &imp.self_ty,
+                "#[furst_export]: impl target must be a simple type name",
+            ));
+        }
+    };
+
+    let snake_prefix = to_snake(type_name.to_string());
+    let mut ffi_fns: Vec<TokenStream2> = Vec::new();
+    let mut has_free = false;
+
+    for item in &imp.items {
+        let syn::ImplItem::Fn(method) = item else {
+            continue;
+        };
+
+        let method_name = &method.sig.ident;
+        let ffi_name = format_ident!("{}_{}", snake_prefix, method_name);
+
+        if method_name == "free" {
+            has_free = true;
+        }
+
+        // Reject generics and async on methods
+        if !method.sig.generics.params.is_empty() {
+            return Err(syn::Error::new_spanned(
+                &method.sig.generics,
+                "#[furst_export]: FFI methods cannot have generic parameters",
+            ));
+        }
+        if method.sig.asyncness.is_some() {
+            return Err(syn::Error::new_spanned(
+                method.sig.asyncness,
+                "#[furst_export]: FFI methods cannot be async",
+            ));
+        }
+
+        // Determine receiver kind: &self, &mut self, self: &Self, self: &mut Self
+        let receiver = match method.sig.inputs.first() {
+            Some(syn::FnArg::Receiver(r)) => {
+                if r.reference.is_some() {
+                    // Shorthand form: &self or &mut self
+                    if r.mutability.is_some() {
+                        Some(true) // &mut self
+                    } else {
+                        Some(false) // &self
+                    }
+                } else {
+                    // Check for typed form: self: &Self or self: &mut Self
+                    match r.ty.as_ref() {
+                        syn::Type::Reference(ref_ty) => {
+                            if ref_ty.mutability.is_some() {
+                                Some(true) // self: &mut Self
+                            } else {
+                                Some(false) // self: &Self
+                            }
+                        }
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                r,
+                                "#[furst_export]: `self` by value is not supported for opaque handles; \
+                                 use `&self` or `&mut self`",
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => None, // associated function (no self)
+        };
+
+        // Build C params
+        let mut c_params: Vec<TokenStream2> = Vec::new();
+        let mut let_bindings: Vec<TokenStream2> = Vec::new();
+        let mut call_args: Vec<TokenStream2> = Vec::new();
+
+        if let Some(is_mut) = receiver {
+            if is_mut {
+                c_params.push(quote! { this: *mut #type_name });
+            } else {
+                c_params.push(quote! { this: *const #type_name });
+            }
+        }
+
+        // Process non-self params
+        let params_iter = method.sig.inputs.iter().filter(|arg| {
+            !matches!(arg, syn::FnArg::Receiver(_))
+        });
+
+        for input in params_iter {
+            let syn::FnArg::Typed(pat_type) = input else {
+                continue;
+            };
+            let pat = &pat_type.pat;
+            let ffi_ty = classify(&pat_type.ty)?;
+
+            match ffi_ty {
+                FfiType::StrRef => {
+                    let name = pat_ident(pat)?;
+                    let ptr_name = format_ident!("{}_ptr", name);
+                    let len_name = format_ident!("{}_len", name);
+                    c_params.push(quote! { #ptr_name: *const u8 });
+                    c_params.push(quote! { #len_name: usize });
+                    let_bindings.push(quote! {
+                        let #name: &str = unsafe {
+                            ::core::str::from_utf8_unchecked(
+                                ::core::slice::from_raw_parts(#ptr_name, #len_name)
+                            )
+                        };
+                    });
+                    call_args.push(quote! { #name });
+                }
+                FfiType::OwnedString => {
+                    return Err(syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "#[furst_export]: `String` is only supported as a return type",
+                    ));
+                }
+                _ => {
+                    let c_ty = ffi_type_to_rust_tokens(&ffi_ty);
+                    c_params.push(quote! { #pat: #c_ty });
+                    call_args.push(quote! { #pat });
+                }
+            }
+        }
+
+        // Classify return type, handling Self → *mut TypeName
+        let ret_is_self = match &method.sig.output {
+            syn::ReturnType::Type(_, ty) => {
+                matches!(ty.as_ref(), syn::Type::Path(tp)
+                    if tp.qself.is_none() && tp.path.is_ident("Self"))
+            }
+            _ => false,
+        };
+
+        let ret_ffi = if ret_is_self {
+            FfiType::OpaquePtr(syn::parse_quote! { *mut #type_name })
+        } else {
+            match &method.sig.output {
+                syn::ReturnType::Default => FfiType::Unit,
+                syn::ReturnType::Type(_, ty) => classify(ty)?,
+            }
+        };
+
+        // Build the inner call expression
+        let inner_call = match receiver {
+            Some(true) => {
+                // &mut self
+                quote! { unsafe { &mut *this }.#method_name(#(#call_args),*) }
+            }
+            Some(false) => {
+                // &self
+                quote! { unsafe { &*this }.#method_name(#(#call_args),*) }
+            }
+            None => {
+                // associated function
+                quote! { #type_name::#method_name(#(#call_args),*) }
+            }
+        };
+
+        // Build return type and wrapping
+        let (c_ret_ty, body) = if ret_is_self {
+            (
+                quote! { -> *mut #type_name },
+                quote! {
+                    #(#let_bindings)*
+                    Box::into_raw(Box::new(#inner_call))
+                },
+            )
+        } else {
+            match &ret_ffi {
+                FfiType::Unit => (quote! {}, quote! { #(#let_bindings)* #inner_call; }),
+                FfiType::OwnedString => (
+                    quote! { -> ::furst_rt::FurstStr },
+                    quote! { #(#let_bindings)* ::furst_rt::FurstStr::from(#inner_call) },
+                ),
+                _ => {
+                    let ty = ffi_type_to_rust_tokens(&ret_ffi);
+                    (
+                        quote! { -> #ty },
+                        quote! { #(#let_bindings)* #inner_call },
+                    )
+                }
+            }
+        };
+
+        ffi_fns.push(quote! {
+            #[no_mangle]
+            pub extern "C" fn #ffi_name(#(#c_params),*) #c_ret_ty {
+                #body
+            }
+        });
+    }
+
+    // Auto-generate free if not explicitly defined
+    if !has_free {
+        let free_name = format_ident!("{}_free", snake_prefix);
+        ffi_fns.push(quote! {
+            #[no_mangle]
+            pub extern "C" fn #free_name(this: *mut #type_name) {
+                if !this.is_null() {
+                    unsafe { drop(Box::from_raw(this)); }
+                }
+            }
+        });
+    }
+
+    // Strip #[furst_export] from the impl block to avoid recursion
+    imp.attrs.retain(|a| !a.path().is_ident("furst_export"));
+
+    Ok(quote! {
+        #imp
+
+        #(#ffi_fns)*
     })
 }
 
