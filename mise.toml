@@ -3,7 +3,7 @@
 rust = "stable"
 
 # .NET SDK
-dotnet = "9"
+dotnet = "10"
 
 # just — task runner for the justfile
 just = "latest"

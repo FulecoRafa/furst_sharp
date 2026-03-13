@@ -1,0 +1,7 @@
+[package]
+name = "furst-rt"
+version = "0.1.0"
+edition = "2021"
+description = "Runtime types for the FurstSharp FFI bridge (FurstStr, furst_free_string)"
+
+[lib]

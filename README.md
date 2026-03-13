@@ -1,48 +1,52 @@
 # FurstSharp
 
-> Export Rust functions to F# with zero boilerplate via a proc-macro attribute.
+> Export Rust functions, structs, and enums to F# with zero boilerplate via a proc-macro attribute.
 
 ## Overview
 
-Annotate any Rust function with `#[furst_export]`:
+Annotate any Rust function, struct, or enum with `#[furst_export]`:
 
 ```rust
 use furst_macro::furst_export;
 
 #[furst_export]
-pub fn fibonacci(n: i64) -> i64 { /* ... */ }
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
 ```
 
-FurstSharp generates the `extern "C"` Rust wrapper and the matching F#
-`DllImport` binding, so you can call it from F# without writing any FFI glue:
+Run `just codegen` to generate the matching F# P/Invoke bindings automatically:
 
 ```fsharp
 open FurstBindings
 
-printfn "%d" (fibonacci 10L)  // prints: 55
+printfn "%d" (add 3 4)  // prints: 7
 ```
 
-## Status
+No manual `extern "C"`, no hand-written `DllImport` — FurstSharp handles both sides.
 
-**Early skeleton.** The macro is currently a pass-through and F# bindings are
-hand-written. See `CLAUDE.md` for implementation status and next steps.
+---
 
 ## Prerequisites
 
-| Tool   | Version   | Notes                        |
-|--------|-----------|------------------------------|
-| Rust   | stable    | via rustup                   |
-| .NET   | 9.x       | `dotnet` CLI                 |
-| just   | latest    | task runner                  |
-| mise   | any       | optional, for pinned versions|
+| Tool  | Version | Notes                         |
+|-------|---------|-------------------------------|
+| Rust  | stable  | via rustup                    |
+| .NET  | 10.x    | `dotnet` CLI                  |
+| just  | latest  | task runner                   |
+| mise  | any     | optional, for pinned versions |
+
+```bash
+# Install pinned versions (requires mise)
+mise install
+```
+
+---
 
 ## Quick Start
 
 ```bash
-# Install pinned tool versions (requires mise)
-mise install
-
-# Build Rust .so, build F# app, and run
+# Full pipeline: generate F# bindings, build Rust .so, build F#, run
 just run
 ```
 
@@ -59,59 +63,200 @@ FurstSharp example — calling Rust fibonacci via P/Invoke
 Success!
 ```
 
-## Project Structure
+---
 
+## Using the Macro in Your Own Crate
+
+### 1. Add dependencies to your `Cargo.toml`
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+furst-macro = { path = "<path-to-furst-macro>" }
+furst-rt    = { path = "<path-to-furst-rt>" }
 ```
-furst-macro/              # The proc-macro crate (the library being built)
-  src/lib.rs              #   #[furst_export] attribute macro
-example/
-  rust-lib/               # Example Rust cdylib using #[furst_export]
-    src/lib.rs            #   fibonacci function
-  fsharp-app/             # F# console app calling the Rust library
-    Generated/
-      FurstBindings.fs    #   P/Invoke declarations (auto-generated, skeleton for now)
-    Program.fs            #   Entry point
+
+### 2. Annotate your functions
+
+```rust
+use furst_macro::furst_export;
+
+/// Plain primitive types — direct FFI mapping
+#[furst_export]
+pub fn multiply(x: f64, y: f64) -> f64 {
+    x * y
+}
+
+/// Strings: &str input splits into (ptr, len); String return becomes FurstStr
+#[furst_export]
+pub fn greet(name: &str) -> String {
+    format!("Hello, {}!", name)
+}
 ```
 
-## Available Tasks
+The macro generates the `#[no_mangle] pub extern "C"` wrapper automatically.
+You write plain Rust — no FFI annotations needed.
 
-| Command              | Description                                  |
-|----------------------|----------------------------------------------|
-| `just build-rust`    | `cargo build` → produces `librust_lib.so`    |
-| `just build-fsharp`  | `dotnet build` the F# project                |
-| `just codegen`       | Generate F# bindings (placeholder)           |
-| `just run`           | Full pipeline: codegen + build + run         |
-| `just test`          | `cargo test` for the Rust crates             |
-| `just check`         | `cargo check` (fast type-check, no linking)  |
-| `just clean`         | Remove all build artifacts                   |
-| `just watch`         | Recheck on file change (requires cargo-watch)|
+### 3. Annotate structs
 
-## How It Works
+```rust
+#[furst_export]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
 
-1. `cargo build` compiles `example/rust-lib` → `target/debug/librust_lib.so`
-2. The `#[no_mangle] extern "C"` on `fibonacci` gives it a stable C symbol
-3. F#'s `[<DllImport(...)>]` declares the native signature
-4. `dotnet run` loads the `.so` at runtime and calls `fibonacci` via P/Invoke
+#[furst_export]
+pub fn distance(a: Point, b: Point) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
+}
+```
 
-The P/Invoke runtime on Linux resolves `libXXX.so` from the bare name `XXX`,
-so no file extension is needed in the `DllImport` path.
+`#[repr(C)]` is added automatically. All fields must use supported types.
 
-## FFI Type Conventions
+### 4. Annotate enums
 
-| Rust type | C ABI type  | F# P/Invoke type |
-|-----------|-------------|------------------|
-| `i64`     | `int64_t`   | `int64`          |
-| `i32`     | `int32_t`   | `int32`          |
-| `f64`     | `double`    | `float`          |
-| `bool`    | `uint8_t`   | `bool`           |
+**C-style (no associated data):**
+
+```rust
+#[furst_export]
+pub enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+```
+
+**Tagged unions (named fields per variant):**
+
+```rust
+#[furst_export]
+pub enum Shape {
+    Circle { radius: f64 },
+    Rectangle { width: f64, height: f64 },
+}
+
+#[furst_export]
+pub fn area(shape: ShapeFfi) -> f64 {
+    // ShapeFfi is generated by the macro; use Shape::from() to convert if needed
+    todo!()
+}
+```
+
+The macro generates `ShapeTag`, `ShapeCircleData`, `ShapeRectangleData`, `ShapeUnion`, `ShapeFfi`, and a `From<Shape> for ShapeFfi` impl.
+
+### 5. Generate F# bindings
+
+```bash
+cargo run -p furst-codegen -- \
+    --input src/              \
+    --output path/to/FurstBindings.fs \
+    --lib-name your_lib_name
+```
+
+The generated file is a complete F# module with:
+- `FurstStr` type and `furst_free_string` binding (always included)
+- One binding per exported function
+- Matching struct types for `#[furst_export]` structs
+- Tag enum + union types for tagged enums
+
+### 6. Use the bindings in F#
+
+```fsharp
+open FurstBindings
+
+// Primitives — call directly
+let result = multiply 3.0 4.0
+
+// Strings — pass via fixed buffer
+let greetResult =
+    let bytes = System.Text.Encoding.UTF8.GetBytes("World")
+    use handle = fixed bytes
+    let s = greet(NativeInterop.NativePtr.toNativeInt handle, unativeint bytes.Length)
+    // read s.ptr / s.len, then free
+    furst_free_string s
+```
+
+---
+
+## Type Mapping
+
+| Rust type       | C ABI                     | F# P/Invoke                        |
+|-----------------|---------------------------|------------------------------------|
+| `i32`           | `int32_t`                 | `int32`                            |
+| `i64`           | `int64_t`                 | `int64`                            |
+| `u32`           | `uint32_t`                | `uint32`                           |
+| `u64`           | `uint64_t`                | `uint64`                           |
+| `f32`           | `float`                   | `float32`                          |
+| `f64`           | `double`                  | `float`                            |
+| `bool`          | `bool`                    | `bool`                             |
+| `()`            | `void`                    | `void`                             |
+| `&str`          | `(*const u8, usize)`      | `(nativeint, unativeint)` pair     |
+| `String`        | `FurstStr { ptr, len, cap }` | `FurstStr` (call `furst_free_string` after use) |
+| `#[furst_export] struct` | `#[repr(C)]` struct | `[<Struct; StructLayout(Sequential)>]` |
+| C-style enum    | `#[repr(i32)]` enum       | F# enum with int backing           |
+| Tagged enum     | `<N>Tag` + `<N>Union` + `<N>Ffi` | Tag enum + union + wrapper struct |
 
 All exported functions use `CallingConvention.Cdecl` (Rust `extern "C"` default).
 
-## Development Notes
+---
 
-- The native library path in `FurstBindings.fs` is hardcoded as a relative
-  path for development. Production packaging requires a different strategy
-  (e.g., `NativeLibrary.SetDllImportResolver` or copying the `.so` alongside
-  the F# binary).
-- Only primitive types are supported in the skeleton. Structs, strings, and
-  slices will require explicit marshalling design.
+## Available Tasks
+
+| Command             | Description                                               |
+|---------------------|-----------------------------------------------------------|
+| `just check`        | `cargo check` — fast type-check, no linking               |
+| `just build-rust`   | `cargo build` → produces `target/debug/librust_lib.so`    |
+| `just build-release`| `cargo build --release` → optimised `.so`                 |
+| `just codegen`      | Generate `FurstBindings.fs` from `#[furst_export]` items  |
+| `just build-fsharp` | `dotnet build` the F# project                             |
+| `just run`          | Full pipeline: codegen + build + run                      |
+| `just test`         | `cargo test` for all Rust crates                          |
+| `just bundle`       | Build release `.so` + `FurstBindings.fs` → `dist/`        |
+| `just clean`        | Remove all build artifacts and `dist/`                    |
+| `just watch`        | Recheck on file change (requires `cargo-watch`)           |
+
+---
+
+## Project Structure
+
+```
+furst-macro/              # Proc-macro: #[furst_export] attribute
+  src/lib.rs              #   Dispatches on fn / struct / enum
+furst-rt/                 # Runtime types used in generated wrappers
+  src/lib.rs              #   FurstStr, furst_free_string
+furst-codegen/            # Binary: scans source, emits FurstBindings.fs
+  src/main.rs             #   CLI: --input, --output, --lib-name, --bundle-dir
+example/
+  rust-lib/               # Example cdylib using #[furst_export]
+    src/lib.rs            #   fibonacci — demonstrates basic usage
+  fsharp-app/             # F# console app calling the Rust library
+    Generated/
+      FurstBindings.fs    #   Generated by `just codegen` — do not edit
+    Program.fs            #   Entry point
+```
+
+---
+
+## How It Works
+
+1. `#[furst_export]` on a `fn` renames the original to `__furst_inner_<name>` and emits a `#[no_mangle] pub extern "C"` wrapper that handles type conversions at the FFI boundary.
+2. `just codegen` runs `furst-codegen`, which uses `syn` to parse the Rust source files, finds every `#[furst_export]` item, and writes the matching F# module.
+3. `cargo build` compiles the Rust crate to a `.so` shared library.
+4. F# loads the `.so` at runtime via P/Invoke and calls the exported symbols directly.
+
+For development, `LD_LIBRARY_PATH=target/debug` is set by `just run` so the runtime can locate the `.so`. For production, copy the `.so` alongside the F# binary or use `just bundle` to produce a self-contained `dist/` folder.
+
+---
+
+## Constraints
+
+- Function parameters cannot use `String` (use `&str` instead)
+- Tagged enum variants must use named fields (`Variant { x: f64 }`, not `Variant(f64)`)
+- Generic functions and `async fn` are not supported across FFI
+- All struct fields and enum variant fields must themselves be FFI-safe types

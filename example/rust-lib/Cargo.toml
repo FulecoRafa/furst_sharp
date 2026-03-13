@@ -10,3 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 furst-macro = { path = "../../furst-macro" }
+furst-rt = { path = "../../furst-rt" }

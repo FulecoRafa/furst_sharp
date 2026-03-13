@@ -1,0 +1,14 @@
+[package]
+name = "furst-codegen"
+version = "0.1.0"
+edition = "2021"
+description = "Code generator: scans Rust sources for #[furst_export] and emits FurstBindings.fs"
+
+[[bin]]
+name = "furst-codegen"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "visit"] }
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"

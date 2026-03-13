@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "furst-macro",
+    "furst-rt",
+    "furst-codegen",
     "example/rust-lib",
 ]
 resolver = "2"
