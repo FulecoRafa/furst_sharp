@@ -1,0 +1,16 @@
+[package]
+name = "furst-macro"
+version = "0.1.0"
+edition = "2021"
+description = "Proc-macro crate for exporting Rust functions to F# via FFI"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# Parse the Rust AST of annotated items
+syn = { version = "2", features = ["full"] }
+# Quasi-quote token streams in macro output
+quote = "1"
+# Work with TokenStream in a testable, non-proc-macro context
+proc-macro2 = "1"

@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "furst-macro",
+    "example/rust-lib",
+]
+resolver = "2"

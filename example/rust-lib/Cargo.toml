@@ -1,0 +1,12 @@
+[package]
+name = "rust-lib"
+version = "0.1.0"
+edition = "2021"
+description = "Example cdylib crate demonstrating furst-macro exports"
+
+[lib]
+# cdylib produces librust_lib.so (Linux) / rust_lib.dll (Windows) for FFI
+crate-type = ["cdylib"]
+
+[dependencies]
+furst-macro = { path = "../../furst-macro" }

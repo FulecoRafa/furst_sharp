@@ -1,0 +1,15 @@
+# Rust
+/target/
+
+# .NET
+example/fsharp-app/bin/
+example/fsharp-app/obj/
+
+# mise local overrides
+.mise.local.toml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~

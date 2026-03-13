@@ -1,0 +1,9 @@
+[tools]
+# Rust — managed via rustup. "stable" is sufficient for proc-macros.
+rust = "stable"
+
+# .NET SDK
+dotnet = "9"
+
+# just — task runner for the justfile
+just = "latest"
