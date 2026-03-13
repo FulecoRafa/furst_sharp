@@ -23,3 +23,49 @@ extern void furst_free_string(FurstStr s)
 
 [<DllImport(NativeLib, EntryPoint = "fibonacci", CallingConvention = CallingConvention.Cdecl)>]
 extern int64 fibonacci(int64 n)
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type Point =
+    val mutable x: float
+    val mutable y: float
+
+[<DllImport(NativeLib, EntryPoint = "distance", CallingConvention = CallingConvention.Cdecl)>]
+extern float distance(Point a, Point b)
+
+type Direction =
+    | North = 0
+    | East = 1
+    | South = 2
+    | West = 3
+
+[<DllImport(NativeLib, EntryPoint = "turn_right", CallingConvention = CallingConvention.Cdecl)>]
+extern Direction turn_right(Direction d)
+
+type ShapeTag =
+    | Circle = 0
+    | Rectangle = 1
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type ShapeCircleData =
+    val mutable radius: float
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type ShapeRectangleData =
+    val mutable width: float
+    val mutable height: float
+
+[<Struct; StructLayout(LayoutKind.Explicit)>]
+type ShapeUnion =
+    [<FieldOffset(0)>] val mutable circle: ShapeCircleData
+    [<FieldOffset(0)>] val mutable rectangle: ShapeRectangleData
+
+[<Struct; StructLayout(LayoutKind.Sequential)>]
+type ShapeFfi =
+    val mutable tag: ShapeTag
+    val mutable data: ShapeUnion
+
+[<DllImport(NativeLib, EntryPoint = "area", CallingConvention = CallingConvention.Cdecl)>]
+extern float area(ShapeFfi shape)
+
+[<DllImport(NativeLib, EntryPoint = "greet", CallingConvention = CallingConvention.Cdecl)>]
+extern FurstStr greet(nativeint name_ptr, unativeint name_len)
