@@ -93,18 +93,18 @@ let main _argv =
         let msg = withRustStr name (fun ptr len -> greet(ptr, len)) |> furstStrToString
         printfn "  greet(%12s) = %s" (sprintf "\"%s\"" name) msg
 
-    // ── 6. Opaque handles: Counter (typed CounterHandle) ───────────────────
+    // ── 6. Opaque handles: Counter (class with IDisposable + Finalize) ────
     printfn ""
-    printfn "[ opaque handles — Counter (impl block → typed CounterHandle) ]"
-    let c = counter_new 42L
-    printfn "  counter_new(42)    → CounterHandle"
-    printfn "  counter_get()      = %d" (counter_get c)
-    counter_increment c
-    counter_increment c
-    counter_increment c
-    printfn "  after 3 increments = %d" (counter_get c)   // 45
-    counter_free c
-    printfn "  counter_free()     ✓"
+    printfn "[ opaque handles — Counter (class, auto-free via IDisposable) ]"
+    // `use` ensures Dispose is called at end of scope
+    use c = Counter.New 42L
+    printfn "  Counter.New(42)    → Counter"
+    printfn "  c.Get()            = %d" (c.Get())
+    c.Increment()
+    c.Increment()
+    c.Increment()
+    printfn "  after 3 increments = %d" (c.Get())   // 45
+    printfn "  (auto-disposed at end of scope)"
 
     printfn ""
     printfn "═══════════════════════════════════════"

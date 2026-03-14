@@ -578,29 +578,25 @@ fn emit_enum(out: &mut String, enm: &syn::ItemEnum, tagged: &HashSet<String>) {
 }
 
 fn emit_impl(out: &mut String, imp: &ImplExport, tagged: &HashSet<String>, _handles: &HashSet<String>) {
-    let handle_name = format!("{}Handle", imp.type_name);
+    let type_name = &imp.type_name;
+    let native_mod = format!("{}Native", type_name);
+    let snake_prefix = to_snake(type_name);
 
-    // Emit handle struct
-    writeln!(out, "// --- {} (opaque handle) ---", imp.type_name).unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "[<Struct; StructLayout(LayoutKind.Sequential)>]").unwrap();
-    writeln!(out, "type {} =", handle_name).unwrap();
-    writeln!(out, "    val mutable private ptr: nativeint").unwrap();
+    // Find the free method name
+    let free_name = format!("{}_free", snake_prefix);
+
+    writeln!(out, "// --- {} (opaque handle) ---", type_name).unwrap();
     writeln!(out).unwrap();
 
-    // Emit each method as a DllImport
+    // 1. Private module with raw DllImport declarations
+    writeln!(out, "module private {} =", native_mod).unwrap();
     for method in &imp.methods {
         let mut params: Vec<String> = Vec::new();
 
-        // Add receiver param if present
-        match method.receiver {
-            ReceiverKind::Ref | ReceiverKind::MutRef => {
-                params.push(format!("{} this", handle_name));
-            }
-            ReceiverKind::None => {}
+        if method.receiver != ReceiverKind::None {
+            params.push("nativeint handle".to_string());
         }
 
-        // Add remaining params
         for (pname, ffi) in &method.params {
             match ffi {
                 FfiType::StrRef => {
@@ -614,9 +610,8 @@ fn emit_impl(out: &mut String, imp: &ImplExport, tagged: &HashSet<String>, _hand
             }
         }
 
-        // Return type
         let ret_str = if method.returns_self {
-            handle_name.clone()
+            "nativeint".to_string()
         } else {
             match &method.ret {
                 FfiType::Unit => "void".to_string(),
@@ -627,13 +622,124 @@ fn emit_impl(out: &mut String, imp: &ImplExport, tagged: &HashSet<String>, _hand
         let params_str = params.join(", ");
         let name = &method.ffi_name;
 
-        writeln!(
-            out,
-            "[<DllImport(NativeLib, EntryPoint = \"{name}\", CallingConvention = CallingConvention.Cdecl)>]"
-        ).unwrap();
-        writeln!(out, "extern {ret_str} {name}({params_str})").unwrap();
+        writeln!(out, "    [<DllImport(NativeLib, EntryPoint = \"{name}\", CallingConvention = CallingConvention.Cdecl)>]").unwrap();
+        writeln!(out, "    extern {ret_str} {name}({params_str})").unwrap();
         writeln!(out).unwrap();
     }
+
+    // 2. Public class with methods, IDisposable, and Finalize
+    writeln!(out, "type {} private (handle: nativeint) =", type_name).unwrap();
+    writeln!(out, "    let mutable disposed = false").unwrap();
+    writeln!(out).unwrap();
+
+    // Emit methods
+    for method in &imp.methods {
+        // Skip the free method — handled by Dispose/Finalize
+        if method.ffi_name == free_name {
+            continue;
+        }
+
+        let method_short_name = method.ffi_name
+            .strip_prefix(&format!("{}_", snake_prefix))
+            .unwrap_or(&method.ffi_name);
+
+        // PascalCase the method name
+        let pascal_name = to_pascal(method_short_name);
+
+        // Build F# param list and call args
+        let mut fsharp_params: Vec<String> = Vec::new();
+        let mut call_args: Vec<String> = Vec::new();
+
+        if method.receiver != ReceiverKind::None {
+            call_args.push("handle".to_string());
+        }
+
+        for (pname, ffi) in &method.params {
+            match ffi {
+                FfiType::StrRef => {
+                    // For now, string params stay as ptr+len (caller handles marshalling)
+                    fsharp_params.push(format!("{}_ptr: nativeint", pname));
+                    fsharp_params.push(format!("{}_len: unativeint", pname));
+                    call_args.push(format!("{}_ptr", pname));
+                    call_args.push(format!("{}_len", pname));
+                }
+                FfiType::OwnedString => continue,
+                other => {
+                    fsharp_params.push(format!("{}: {}", pname, fsharp_type(other, tagged)));
+                    call_args.push(pname.clone());
+                }
+            }
+        }
+
+        let call_args_str = call_args.join(" ");
+        let ffi_fn = &method.ffi_name;
+
+        if method.returns_self {
+            // Static factory method
+            let fsharp_params_str = if fsharp_params.is_empty() {
+                "()".to_string()
+            } else {
+                format!("({})", fsharp_params.join(", "))
+            };
+            writeln!(out, "    static member {}{} =", pascal_name, fsharp_params_str).unwrap();
+            writeln!(out, "        new {}({}.{} {})", type_name, native_mod, ffi_fn, call_args_str).unwrap();
+        } else {
+            // Instance method
+            let ret_type = match &method.ret {
+                FfiType::Unit => None,
+                other => Some(fsharp_type(other, tagged)),
+            };
+
+            let fsharp_params_str = if fsharp_params.is_empty() {
+                "()".to_string()
+            } else {
+                format!("({})", fsharp_params.join(", "))
+            };
+
+            match ret_type {
+                Some(rt) => {
+                    writeln!(out, "    member _.{}{} : {} =", pascal_name, fsharp_params_str, rt).unwrap();
+                }
+                None => {
+                    writeln!(out, "    member _.{}{} =", pascal_name, fsharp_params_str).unwrap();
+                }
+            }
+            writeln!(out, "        {}.{} {}", native_mod, ffi_fn, call_args_str).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    // Dispose helper (private)
+    writeln!(out, "    member private this.Free() =").unwrap();
+    writeln!(out, "        if not disposed then").unwrap();
+    writeln!(out, "            disposed <- true").unwrap();
+    writeln!(out, "            {}.{} handle", native_mod, free_name).unwrap();
+    writeln!(out).unwrap();
+
+    // Finalize (destructor — called by GC if Dispose wasn't called)
+    writeln!(out, "    override this.Finalize() =").unwrap();
+    writeln!(out, "        this.Free()").unwrap();
+    writeln!(out).unwrap();
+
+    // IDisposable
+    writeln!(out, "    interface System.IDisposable with").unwrap();
+    writeln!(out, "        member this.Dispose() =").unwrap();
+    writeln!(out, "            this.Free()").unwrap();
+    writeln!(out, "            System.GC.SuppressFinalize(this)").unwrap();
+}
+
+/// Convert snake_case to PascalCase (e.g., "new" → "New", "get_value" → "GetValue")
+fn to_pascal(s: &str) -> String {
+    s.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 fn to_snake(s: &str) -> String {

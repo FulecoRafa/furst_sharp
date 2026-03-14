@@ -72,19 +72,40 @@ extern FurstStr greet(nativeint name_ptr, unativeint name_len)
 
 // --- Counter (opaque handle) ---
 
-[<Struct; StructLayout(LayoutKind.Sequential)>]
-type CounterHandle =
-    val mutable private ptr: nativeint
+module private CounterNative =
+    [<DllImport(NativeLib, EntryPoint = "counter_new", CallingConvention = CallingConvention.Cdecl)>]
+    extern nativeint counter_new(int64 initial)
 
-[<DllImport(NativeLib, EntryPoint = "counter_new", CallingConvention = CallingConvention.Cdecl)>]
-extern CounterHandle counter_new(int64 initial)
+    [<DllImport(NativeLib, EntryPoint = "counter_increment", CallingConvention = CallingConvention.Cdecl)>]
+    extern void counter_increment(nativeint handle)
 
-[<DllImport(NativeLib, EntryPoint = "counter_increment", CallingConvention = CallingConvention.Cdecl)>]
-extern void counter_increment(CounterHandle this)
+    [<DllImport(NativeLib, EntryPoint = "counter_get", CallingConvention = CallingConvention.Cdecl)>]
+    extern int64 counter_get(nativeint handle)
 
-[<DllImport(NativeLib, EntryPoint = "counter_get", CallingConvention = CallingConvention.Cdecl)>]
-extern int64 counter_get(CounterHandle this)
+    [<DllImport(NativeLib, EntryPoint = "counter_free", CallingConvention = CallingConvention.Cdecl)>]
+    extern void counter_free(nativeint handle)
 
-[<DllImport(NativeLib, EntryPoint = "counter_free", CallingConvention = CallingConvention.Cdecl)>]
-extern void counter_free(CounterHandle this)
+type Counter private (handle: nativeint) =
+    let mutable disposed = false
 
+    static member New(initial: int64) =
+        new Counter(CounterNative.counter_new initial)
+
+    member _.Increment() =
+        CounterNative.counter_increment handle
+
+    member _.Get() : int64 =
+        CounterNative.counter_get handle
+
+    member private this.Free() =
+        if not disposed then
+            disposed <- true
+            CounterNative.counter_free handle
+
+    override this.Finalize() =
+        this.Free()
+
+    interface System.IDisposable with
+        member this.Dispose() =
+            this.Free()
+            System.GC.SuppressFinalize(this)
